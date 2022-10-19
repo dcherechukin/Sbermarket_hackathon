@@ -1,0 +1,606 @@
+# Task 1
+# import librarys
+import pandas as pd
+import numpy as np
+from matplotlib import pyplot as plt
+plt.style.use('ggplot')
+import pylab
+import seaborn as sns
+import warnings
+warnings.filterwarnings("ignore")
+import time
+import os
+import sys
+import holidays
+from datetime import datetime, timedelta
+from sklearn.metrics import mean_absolute_percentage_error as mape
+import catboost
+from sklearn.model_selection import GridSearchCV
+
+# import data for 1 task
+orders = pd.read_csv('orders.csv') 
+
+# function for futures creating
+def create_features(df):
+    df['year'] = df['date'].apply(lambda x: x.year)
+    df['month'] = df['date'].apply(lambda x: x.month)
+    df['day'] = df['date'].apply(lambda x: x.day)
+    df['hour'] = df['date'].apply(lambda x: x.hour)
+    df['weekday'] = df['date'].apply(lambda x: pd.Timestamp.weekday(x)) #Weekday
+    df['week_number'] = df['date'].dt.isocalendar().week #Week number
+    # Days for nearest holiday
+    holiday = [pd.Timestamp(i) for i in holidays.Russia(years = [2021, 2022])]
+    array = []
+    for j in df['date']:
+        array.append(min([abs(j-i) for i in holiday]).days)
+    df['days_nearest_holiday'] = array
+    return df
+
+orders['date'] = [pd.Timestamp(x) for x in orders['date']]
+orders = create_features(orders)
+
+# create new week for predictions
+first = pd.Timestamp(year=sorted(orders.loc[orders['week_number'] == orders['week_number'].unique()[-1:][0]]['year'].unique(), reverse= True)[0],
+             month=sorted(orders.loc[orders['week_number'] == orders['week_number'].unique()[-1:][0]]['month'].unique(), reverse= True)[0], 
+             day=sorted(orders.loc[orders['week_number'] == orders['week_number'].unique()[-1:][0]]['day'].unique(), reverse= True)[0], 
+             hour=7) + timedelta(days = 1)
+# fuction for day creating
+def create_day(_, area):
+    __ = pd.DataFrame()
+    __['date'] = [_ + timedelta(hours = i) for i in range(17)]
+    __['delivery_area_id'] = [area] * 17
+    return __
+new_week = pd.DataFrame()
+for area in orders['delivery_area_id'].unique():
+    first_ = first
+    for i in range(7):
+        new_week  = pd.concat([new_week, create_day(first_, area)], ignore_index=True)
+        first_ = first_ + timedelta(hours = 24)
+new_week = create_features(new_week)
+
+# merging dataframes and data for a new week
+orders = pd.concat([orders, new_week], ignore_index = True).fillna(0)
+
+# counting orders per 1 day
+count = 0
+orders_per_day = []
+modified_orders = pd.DataFrame()
+for area in orders['delivery_area_id'].unique():
+    for month in orders.loc[orders['delivery_area_id'] == area]['month'].unique():
+        for week_number in orders.loc[(orders['month'] == month) & (orders['delivery_area_id'] == area)]['week_number'].unique():
+            for day in orders.loc[(orders['month'] == month) & (orders['delivery_area_id'] == area) & (orders['week_number'] == week_number)]['day'].unique():
+                modified_orders = modified_orders.append(orders.loc[(orders['month'] == month) & (orders['delivery_area_id'] == area) & (orders['week_number'] == week_number) & (orders['day'] == day)].reset_index().iloc[0], ignore_index = True)
+                orders_per_day.append(np.sum(orders.loc[(orders['month'] == month) & (orders['delivery_area_id'] == area) & (orders['week_number'] == week_number) & (orders['day'] == day)]['orders_cnt']))
+                sys.stdout.write('\r' + ' ' * 50 + '\r')  # Очищение строки
+                sys.stdout.write(f'Ready at ' + str(modified_orders.shape[0]) + ' /101357 ')
+                sys.stdout.flush()
+modified_orders['orders_per_day'] = orders_per_day
+
+# fuction for previous weeks sum of orders
+def sum_prev_weeks(df):
+    df.reset_index()
+    medians = []
+    sum_per_1_week = []
+    sum_per_2_weeks = []
+    sum_per_3_weeks = []
+    orders_per_day_norm = []
+    for w_n in df['week_number']:
+        if w_n >= df.iloc[0]['week_number'] + 3:
+            median = np.median(df.loc[df['week_number'] == w_n - 1]['orders_per_day'])
+            medians.append(median)
+            sum_per_1_week.append(np.sum(df.loc[df['week_number'] == w_n ]['orders_per_day'])/median)
+            sum_per_2_weeks.append(np.sum(df.loc[(df['week_number'] == w_n) | (df['week_number'] == w_n - 1)]['orders_per_day'])/median)
+            sum_per_3_weeks.append(np.sum(df.loc[(df['week_number'] == w_n) | (df['week_number'] == w_n - 1) |(df['week_number'] == w_n - 2) ]['orders_per_day'])/median)
+        else:
+            sum_per_1_week.append(0)
+            sum_per_2_weeks.append(0)
+            sum_per_3_weeks.append(0)
+            medians.append(0)
+    df['sum_per_1_week'] = sum_per_1_week
+    df['sum_per_2_weeks'] = sum_per_2_weeks
+    df['sum_per_3_weeks'] = sum_per_3_weeks
+    return df, medians
+    
+    for area in df['delivery_area_id']:
+        for date in df.loc[df['delivery_area_id'] == area]['date']:
+            median = np.median(df.loc[df.loc[(df['delivery_area_id'] == area)]])
+
+# normalize orders per 1 day and adding median of prev week per every day
+modified_orders_new = pd.DataFrame()
+medians = []
+for area in sorted(modified_orders['delivery_area_id'].unique()):
+    data, new_medians = sum_prev_weeks(modified_orders.loc[modified_orders['delivery_area_id'] == area].sort_values(by = ['delivery_area_id', 'date']))
+    medians += new_medians
+    normilize_orders = [0]
+    for i in range(data.shape[0]-1):
+        if (new_medians[i] != 0):
+            normilize_orders.append(data.reset_index()['orders_per_day'][i+1] / new_medians[i])
+        else: 
+            normilize_orders.append(0)
+    data['norm_orders_per_day'] = normilize_orders
+    data['median_for_prev_week'] = new_medians
+    modified_orders_new = modified_orders_new.append(data, ignore_index=True) 
+    sys.stdout.write('\r' + ' ' * 50 + '\r')  # Очищение строки
+    sys.stdout.write(f'Ready at ' + str(area) + ' /592 ')
+    sys.stdout.flush()
+modified_orders_new.drop(modified_orders_new.loc[(modified_orders_new.sum_per_1_week == 0)&(modified_orders_new.month != 12)].index)
+modified_orders_new.reset_index(drop = True)
+
+# prepearing data for ML
+modified_orders_new = modified_orders_new.reindex(columns=['delivery_area_id', 'month', 'day', 'weekday', 'days_nearest_holiday', 'week_number', 'sum_per_3_weeks', 'sum_per_2_weeks', 'sum_per_1_week', 'median_for_prev_week', 'norm_orders_per_day'])
+modified_orders_new.reset_index(drop =True) # сбрасываем индексы
+for index, row in modified_orders_new.loc[modified_orders_new['week_number'] == 49].iterrows():
+    if row.isin([np.inf, np.nan]).values.any() == True:
+        modified_orders_new.iloc[index]['sum_per_3_weeks'] =modified_orders_new.iloc[index-1]['sum_per_3_weeks']
+        modified_orders_new.iloc[index]['sum_per_2_weeks'] = modified_orders_new.iloc[index-1]['sum_per_2_weeks']
+        modified_orders_new.iloc[index]['sum_per_1_week'] = modified_orders_new.iloc[index-1]['sum_per_1_week']
+        modified_orders_new.iloc[index]['median_for_prev_week'] = modified_orders_new.iloc[index-1]['median_for_prev_week']
+modified_orders_new.drop(modified_orders_new.loc[modified_orders_new['week_number'] <16].index, inplace=True)
+modified_orders_new = modified_orders_new.fillna(0)
+for index, row in modified_orders_new.loc[modified_orders_new['week_number'] == 49].iterrows():
+    if row['median_for_prev_week'] == 0:
+        modified_orders_new.iloc[index]['median_for_prev_week'] = modified_orders_new.iloc[index-1]['median_for_prev_week']
+#modified_orders_new.to_csv('modified_orders_new.csv', index = True)
+
+modified_orders_new.reset_index(drop =True) # сбрасываем индексы
+def data_preparation_for_ML (df):
+    test = df.loc[(df['month'] == 12)] # то что хотим предсказать - это уже 12 месяц
+    train = df.drop(test.index)
+    Features = ['delivery_area_id', 
+                'month', 
+                'day', 
+                'weekday', 
+                'days_nearest_holiday', 
+                'week_number', 
+                'sum_per_3_weeks', 
+                'sum_per_2_weeks', 
+                'sum_per_1_week', 
+                'median_for_prev_week']
+    Target = ['norm_orders_per_day']
+    X_train = train[Features]
+    y_train = train[Target]
+    X_test = test[Features]
+    y_test = test[Target]
+    return X_train, y_train, X_test, y_test
+# functions for ML
+def ML_themself(X_train, y_train, X_test, y_test):
+    cat = catboost.CatBoostRegressor(n_estimators=300, loss_function= 'MAE', depth=7)
+    cat.fit(X_train,y_train,verbose=False, plot=False)
+    X_test['predictions_norm'] = cat.predict(X_test)
+    X_test['prediction'] = X_test['predictions_norm'].T * X_test['median_for_prev_week']
+    X_test['prediction'] = [int(round(x, 0)) for x in X_test['prediction']]
+    return X_test   
+
+def ML_themself_grid(X_train, y_train, X_test, y_test):
+#    grid = {'learning_rate': [0.03],
+#            'depth': [3],
+#            'l2_leaf_reg': [ 3],
+#            'n_estimators': [100],
+#            'loss_function': ['MAPE']
+#           }
+    grid = {'learning_rate': [0.03, 0.1],
+            'depth': [3, 5, 7, 9],
+            'l2_leaf_reg': [ 3, 5, 7],
+            'n_estimators': [100, 500, 2000],
+            'loss_function': ['MAPE', 'RMSE']
+           }
+    cat = catboost.CatBoostRegressor()
+    grid_search = GridSearchCV(estimator = cat,
+                               param_grid = grid,
+                               cv = 5,
+                               scoring = 'neg_mean_absolute_percentage_error')
+    grid_result = grid_search.fit(X_train, y_train)
+    final_model = cat.set_params(**grid_result.best_params_)
+    final_model.fit(X_train, y_train)
+    X_test['predictions_norm'] = final_model.predict(X_test)
+    X_test['prediction'] = X_test['predictions_norm'].T * X_test['median_for_prev_week']
+    X_test['prediction'] = [int(round(x, 0)) for x in X_test['prediction']]
+    return X_test 
+# fitting and prediction for every weekday 
+predictions = pd.DataFrame()
+weekdays_hour_distribution = pd.DataFrame()
+for weekday in modified_orders_new['weekday'].unique():
+    X_train, y_train, X_test, y_test = data_preparation_for_ML(modified_orders_new.loc[modified_orders_new['weekday'] == weekday])
+    test_predictions = ML_themself_grid(X_train, y_train, X_test, y_test)
+    predictions = pd.concat([predictions, test_predictions], ignore_index = False)
+    sys.stdout.write('\r' + ' ' * 50 + '\r')  
+    sys.stdout.write(f'Ready at ' + str(weekday) + ' /6 ')
+    sys.stdout.flush()
+predictions.reset_index(drop=True)
+
+# estimating weekday hour distribution
+weekdays_hour_distribution = pd.DataFrame()
+for weekday in modified_orders_new['weekday'].unique():
+    ind = ['7', '8', '9', '10', '11', '12', '13', '14', '15', '16', '17', '18', '19', '20', '21', '22', '23']
+    hour_distribution = []
+    all = np.sum(orders.loc[orders['weekday'] == weekday]['orders_cnt'])
+    for hour in sorted(orders['hour'].unique()):
+        hour_distribution.append(np.sum(orders.loc[(orders['weekday'] == weekday) & (orders['hour'] == hour)]['orders_cnt']) / all)
+    weekdays_hour_distribution = weekdays_hour_distribution.append(pd.Series(hour_distribution, index = ind), ignore_index=True)
+
+weekdays_hour_distribution.reindex(columns=ind)
+
+# creating result dataframe
+result = pd.DataFrame()
+for row in range(predictions.shape[0]):
+    for i in range(weekdays_hour_distribution.shape[0]):
+        if predictions.iloc[row]['weekday'] == i:
+            data = pd.DataFrame()
+            data ['predictions_for_hours'] = [int(round(x,0)) for x in weekdays_hour_distribution.iloc[i]*predictions.iloc[row]['prediction']]
+            data['year'] = [2021]* 17
+            data['month'] = [ predictions.iloc[row]['month']]*17
+            data['day'] = [ predictions.iloc[row]['day']]*17
+            data['hour'] = ind
+            data ['delivery_area_id'] = [predictions.iloc[row]['delivery_area_id']]*17
+            result = result.append(data, ignore_index = True)
+
+result['orders_cnt'] = result['predictions_for_hours']
+result['date'] = [0]*result.shape[0]
+for  index, row in result.iterrows():
+  result['date'][index] = str(datetime(int(row['year']), int(row['month']), int(row['day']), int(row['hour']), 0))
+result.drop(columns = ['predictions_for_hours', 'year', 'month', 'day', 'hour'], inplace =True)
+result.reindex(columns=['delivery_area_id', 'date', 'orders_cnt'])
+
+# Task 2
+
+import numpy as np
+import pandas as pd
+from datetime import datetime, timedelta
+import pandas as pd
+import numpy as np
+from sklearn.ensemble import GradientBoostingRegressor
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler,LabelEncoder
+from sklearn.datasets import load_breast_cancer
+from sklearn.metrics import mean_squared_error,r2_score
+from sklearn.metrics import mean_absolute_percentage_error
+from sklearn.linear_model import LinearRegression
+from sklearn.ensemble import RandomForestClassifier
+from sklearn import svm
+import catboost as cb
+#import shap
+from sklearn.inspection import permutation_importance
+from google.colab import files
+
+def dev(x, y):
+  return x/y
+
+desired_width = 400
+pd.set_option('display.width', desired_width)
+
+#1 часть
+#Загружаем данные
+orders = pd.read_csv('orders.csv')
+
+partners = pd.read_csv('partners_delays.csv')
+
+print("orders.shape, partners.shape")
+
+print(orders.shape)
+print(partners.shape)
+
+# Объединяем в одну таблицу (если компу слишком тяжко, закомментить часть с !! по !! и взять таблицу partners_orders.csv)
+#!!
+partners_orders = pd.merge(partners, orders,
+                           left_on=['dttm', 'delivery_area_id'], right_on=['date', 'delivery_area_id'], how='inner')
+
+partners_orders = partners_orders.drop(columns=['dttm'])
+
+partners_orders['perc'] = partners_orders.apply(lambda x: dev(x['orders_cnt'], x['partners_cnt']), axis=1)
+
+# раскоментить если нужно сохранить таблицу partners_orders.csv
+#partners_orders.to_csv('partners_orders.csv') 
+#files.download('partners_orders.csv') 
+
+
+#!!
+
+#Загружаем данные, если с !! по !! было слишком тяжко 
+# partners_orders = pd.read_csv('partners_orders.csv')
+
+# 2 часть
+# Тут скачиваем предсказанные в 1-ой задаче данные (для примера пока та же табоица)
+#orders_new = pd.read_csv('orders.csv') #То, что мы предскажем
+orders_new = result
+#orders_new = pd.concat([orders[len(orders)-30:len(orders)], orders[2000:2030]])
+
+#Ищем максимальное кол-во заказов в час
+maximum = orders_new['orders_cnt'].max()
+
+# Создаем таблицу с колонкой от 1 до максим кол-ва заказов
+part = pd.DataFrame([i for i in range(1,maximum + 1)], columns = ['partners_cnt'])
+orders_new['key'] = 1
+part['key'] = 1
+print(part)
+
+#Объединяем (прямое произведение) нашу предсказанную таблицу с таблицей курьеров (от 1 до макс которая)
+orders_new = pd.merge(orders_new, part, on='key').drop("key", 1)
+orders_new = orders_new.sort_values(["date"], ignore_index=True)
+
+# Считаем отношение кол-во заказов/кол-во курьеров
+orders_new['perc'] = orders_new.apply(lambda x: dev(x['orders_cnt'], x['partners_cnt']), axis=1)
+
+print("orders_new")
+print(orders_new)
+
+y = partners_orders['delay_rate']
+
+print("partners_orders.dtypes")
+
+print(partners_orders.dtypes)
+
+
+def day_of_week(x):
+    date_tek = datetime.strptime(x, "%Y-%m-%d %H:%M:%S")
+    return datetime.isoweekday(date_tek)
+
+
+def times_of_day(x):
+    date_tek = datetime.strptime(x, "%Y-%m-%d %H:%M:%S")
+    if date_tek.hour < 13:
+        return 0
+    elif date_tek.hour <= 16:
+        return 1
+    elif date_tek.hour < 21:
+        return 2
+    else:
+        return 3
+
+
+partners_orders['weekday'] = partners_orders.apply(lambda x: day_of_week(x['date']), axis=1)
+
+partners_orders['times_of_day'] = partners_orders.apply(lambda x: times_of_day(x['date']), axis=1)
+
+orders_new['weekday'] = orders_new.apply(lambda x: day_of_week(x['date']), axis=1)
+
+orders_new['times_of_day'] = orders_new.apply(lambda x: times_of_day(x['date']), axis=1)
+
+def dev(x, y):
+  if y != 0:
+    return x/y
+  else: return 0
+
+if 'Unnamed: 0' in partners_orders.columns:
+  partners_orders = partners_orders.drop(columns=['Unnamed: 0'])
+  
+
+partners_orders = partners_orders.drop(columns=['date', 'delay_rate'])
+date = orders_new['date'] 
+orders_new = orders_new.drop(columns=['date'])
+
+#X = partners_orders[0:40000]
+#y = y[0:40000]
+print("partners_orders")
+
+print(partners_orders)
+
+
+X_test = orders_new.reindex(columns=partners_orders.columns)
+X_train = partners_orders
+y_train = y
+
+#X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.1, random_state=1)
+#print(type(y_test))
+
+scaler = StandardScaler()
+# Fit on the training data
+scaler.fit(X_train)
+# Transform both the training and testing data
+X_train = scaler.transform(X_train)
+X_test = scaler.transform(X_test)
+
+scl_2 = StandardScaler()
+scl_2 = scl_2.fit(y_train.values.reshape(len(y_train), 1))
+
+# standardization the dataset and print the first 5 rows
+#y_test = scl_2.transform(y_test.values.reshape(len(y_test), 1))
+y_train = scl_2.transform(y_train.values.reshape(len(y_train), 1))
+
+train_dataset = cb.Pool(X_train, y_train)
+#test_dataset = cb.Pool(X_test, y_test)
+
+params = {'loss_function': 'MAPE',
+ #'task_type': 'GPU',
+ 'depth': 6,
+ 'l2_leaf_reg': 1,
+ 'iterations': 1000,
+ 'learning_rate': 0.01}
+
+
+### Тренируем
+#gbr = GradientBoostingRegressor(**params)
+#gbr = svm.SVR()
+#gbr = LinearRegression()
+
+model = cb.CatBoostRegressor(**params)
+
+grid = {'iterations': [200, 350], #50 150
+        'learning_rate': [0.01, 0.03], #0.1
+        'depth': [6, 8, 10], #2,4
+        'l2_leaf_reg': [0.2, 1, 3]}#0.2, 1
+#grid_search_result = model.grid_search(grid, train_dataset,
+#                                       search_by_train_test_split = True, verbose = False, plot = True)
+#print(grid_search_result)
+
+model.fit(X_train,y_train)
+
+#gbr.fit(X_train,y_train)
+
+### Вычисляем точность
+#train_accuracy_score=gbr.score(X_train,y_train)
+#print(train_accuracy_score)
+
+#test_accuracy_score=gbr.score(X_test,y_test)
+#print(test_accuracy_score)
+
+#y_pred = gbr.predict(X_test)
+
+pred = model.predict(X_test)
+#rmse = (np.sqrt(mean_squared_error(y_test, pred)))
+#r2 = r2_score(y_test, pred)
+#MAPE = mean_absolute_percentage_error(y_test, pred)
+
+#print('Testing performance')
+# print('RMSE: {:.2f}'.format(rmse))
+# print('R2: {:.2f}'.format(r2))
+# print('MAPE: {:.2f}'.format(MAPE))
+
+y_res = scl_2.inverse_transform(pred.reshape(len(pred), 1))
+print(len(y_res))
+X_res = scaler.inverse_transform(X_test)
+X_res = np.column_stack((X_res, date.to_numpy()))
+
+#еще нужно отобрать оптимальное число курьеров y_res < 0.05, дальше 3 задача 
+# for i in range (len(y_res)):
+#   if (y_res[i] < 0.05):
+#     print ("i:", i,"X:", X_res[i],"y", y_res[i])
+
+X_res = np.column_stack((X_res, y_res))
+df = pd.DataFrame(X_res, columns = ['delivery_area_id', 'partners_cnt', 'orders_cnt', 'perc', 'weekday',  'times_of_day', 'date', 'delay_rate'])
+
+df = df.drop(np.where(df['delay_rate'] >= 0.05)[0])
+
+res_partn_cnt = df.groupby(['date', 'delivery_area_id']).agg({'partners_cnt': ['min']})
+res_partn_cnt.columns = ['partners_min_cnt']
+res_partn_cnt = res_partn_cnt.reset_index()
+
+#res_partn_cnt.to_csv('res_partn_cnt.csv') 
+#files.download('res_partn_cnt.csv')
+
+# Task 3
+
+import numpy as np
+from scipy.optimize import linprog, milp, Bounds, LinearConstraint
+import time
+from datetime import datetime, timedelta
+import pandas as pd
+
+
+def get_A(hours):
+  A = []
+
+  for i in range(4, 9):
+    if (hours - i + 1 < 0):
+      continue
+    for j in range(hours - i + 1):
+      sm = [0 for k in range(hours)]
+      for l in range(i):
+        sm[j + l] = 1
+      A.append(sm)
+  return A
+
+def lin_prog_smen (hours, h):
+  res = []
+  A = get_A(hours)
+  #print("h:", h.values)
+  #print("A:", A)
+  A_1 = np.array(A).T.tolist()
+  # print(len(h), len(A_1), len(A_1[0]))
+  #h = [1, 5, 3, 1, 2, 1, 3, 5, 6, 3, 1]
+
+  start = time.time()
+  c = [1 for i in range(len(A_1[0]))]
+  A_ub = A_1
+  b_ub = h.values
+
+  constraints = LinearConstraint(A_ub, b_ub)
+  m = milp(c, constraints=constraints, integrality=1, bounds=[0, np.inf])
+  #print(m.x, len(m.x), len(A_1))
+  stop = time.time()
+  #print("Время :")
+  #print(stop - start)
+
+  #print(m)
+  if m.status == 0:
+    res_smen = m.x
+    for i in range(len(res_smen)):
+      if (res_smen[i] > 0):
+        for j in range(int(res_smen[i])):
+          res.append(A[i])
+        # print(A[i])
+  return res
+
+
+def to_time(str):
+  return datetime.strptime(str, '%Y-%m-%d %H:%M:%S')
+
+#res_partn_cnt = pd.read_csv('res_partn_cnt.csv')
+
+#res_partn_cnt = pd.concat([res_partn_cnt[5:29], res_partn_cnt[30:]])
+
+res_partn_cnt['datetime'] = res_partn_cnt.apply(lambda x: to_time(x['date']), axis=1)
+
+res_partn_cnt = res_partn_cnt.drop(columns = 'date')
+
+res_partn_cnt["date"] = res_partn_cnt["datetime"].dt.date
+res_partn_cnt["time"] = res_partn_cnt["datetime"].dt.time
+
+res_partn_cnt = res_partn_cnt.drop(columns = 'datetime')
+
+
+#print(res_partn_cnt)
+res_partn_cnt['delivery_area_id'].astype('int')
+
+
+res_array = []
+res_origin_array = []
+
+max_area_id = np.max(res_partn_cnt['delivery_area_id'])
+#print(max_area_id)
+# идем по всем областям доставки
+for i in range(int(max_area_id)+1):
+  arr = res_partn_cnt[res_partn_cnt['delivery_area_id'] == i]
+  # если область пропущена, то добавляем пустое начение в массив областей и идем дальеш
+  if (arr.empty):
+    res_array.append({})
+    res_origin_array.append({})
+    continue
+  # ищем начало и конец в данных по дате в области
+  from_date = np.min(arr['date'])
+  to_date = np.max(arr['date'])
+
+  delta = to_date - from_date + timedelta(days=1)
+  date_arr = []
+  res_list = []
+  origin_list = []
+# идем по всем дням
+
+  for cnt_days in range(delta.days):
+    # выбираем таблицу по конкретному дню в конкретной области
+    tek_date = from_date + timedelta(days=cnt_days)
+    tec_day_and_area_table = arr[arr['date'] == tek_date]
+
+    from_time = np.min(tec_day_and_area_table['time'])
+    to_time = np.max(tec_day_and_area_table['time'])
+
+    delta_time = to_time.hour - from_time.hour + 1
+    hours = int(delta_time)
+    #print("DAYS:", cnt_days, i)
+
+    cnt_part = tec_day_and_area_table['partners_min_cnt']
+
+    res_matr = lin_prog_smen(hours, cnt_part)
+    # print(res_matr)
+    date_arr.append(tek_date.strftime("%Y-%m-%d"))
+    res_list.append([from_time.hour, res_matr])
+    origin_list.append(cnt_part.values)
+
+    a = {k:v for k, v in zip(date_arr, res_list)}
+    b = {k: v for k, v in zip(date_arr, origin_list)}
+  res_array.append(a)
+  res_origin_array.append((b))
+
+#print(res_array[0]['2021-09-22'])
+# print(res_array[0]['2021-09-23'])
+
+print("\n\n\n", res_array)
+
+#f = open('text.txt', 'r')
+
+#with open("text.txt", "w") as file:
+ # print(res_array, file=file)
+
+#with open("text_orig.txt", "w") as file:
+ # print(res_origin_array, file=file)
+
+
